@@ -134,3 +134,7 @@ Android.bp
 out
 error.log
 link.txt
+
+# my
+*.diff
+xbuild.sh
