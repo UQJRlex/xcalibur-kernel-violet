@@ -43,6 +43,7 @@ struct ps_device {
 	uint32_t fw_version;
 
 	int (*parse_report)(struct ps_device *dev, struct hid_report *report, u8 *data, int size);
+	void (*remove)(struct ps_device *dev);
 };
 
 /* Calibration data for playstation motion sensors. */
@@ -163,6 +164,7 @@ struct dualsense {
 	struct led_classdev player_leds[5];
 
 	struct work_struct output_worker;
+	bool output_worker_initialized;
 	void *output_report_dmabuf;
 	uint8_t output_seq; /* Sequence number for output report. */
 };
@@ -282,6 +284,7 @@ static const struct {int x; int y; } ps_gamepad_hat_mapping[] = {
 	{0, 0},
 };
 
+static inline void dualsense_schedule_work(struct dualsense *ds);
 /*
  * Add a new ps_device to ps_devices if it doesn't exist.
  * Return error on duplicate device, which can happen if the same
@@ -667,19 +670,22 @@ static int dualsense_get_calibration_data(struct dualsense *ds)
 	 */
 	speed_2x = (gyro_speed_plus + gyro_speed_minus);
 	ds->gyro_calib_data[0].abs_code = ABS_RX;
-	ds->gyro_calib_data[0].bias = gyro_pitch_bias;
+	ds->gyro_calib_data[0].bias = 0;
 	ds->gyro_calib_data[0].sens_numer = speed_2x*DS_GYRO_RES_PER_DEG_S;
-	ds->gyro_calib_data[0].sens_denom = gyro_pitch_plus - gyro_pitch_minus;
+	ds->gyro_calib_data[0].sens_denom = abs(gyro_pitch_plus - gyro_pitch_bias) +
+			abs(gyro_pitch_minus - gyro_pitch_bias);
 
 	ds->gyro_calib_data[1].abs_code = ABS_RY;
-	ds->gyro_calib_data[1].bias = gyro_yaw_bias;
+	ds->gyro_calib_data[1].bias = 0;
 	ds->gyro_calib_data[1].sens_numer = speed_2x*DS_GYRO_RES_PER_DEG_S;
-	ds->gyro_calib_data[1].sens_denom = gyro_yaw_plus - gyro_yaw_minus;
+	ds->gyro_calib_data[1].sens_denom = abs(gyro_yaw_plus - gyro_yaw_bias) +
+			abs(gyro_yaw_minus - gyro_yaw_bias);
 
 	ds->gyro_calib_data[2].abs_code = ABS_RZ;
-	ds->gyro_calib_data[2].bias = gyro_roll_bias;
+	ds->gyro_calib_data[2].bias = 0;
 	ds->gyro_calib_data[2].sens_numer = speed_2x*DS_GYRO_RES_PER_DEG_S;
-	ds->gyro_calib_data[2].sens_denom = gyro_roll_plus - gyro_roll_minus;
+	ds->gyro_calib_data[2].sens_denom = abs(gyro_roll_plus - gyro_roll_bias) +
+			abs(gyro_roll_minus - gyro_roll_bias);
 
 	/*
 	 * Set accelerometer calibration and normalization parameters.
@@ -707,6 +713,7 @@ err_free:
 	kfree(buf);
 	return ret;
 }
+
 
 static int dualsense_get_firmware_info(struct dualsense *ds)
 {
@@ -792,6 +799,16 @@ static void dualsense_init_output_report(struct dualsense *ds, struct dualsense_
 		rp->usb = usb;
 		rp->common = &usb->common;
 	}
+}
+
+static inline void dualsense_schedule_work(struct dualsense *ds)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&ds->base.lock, flags);
+	if (ds->output_worker_initialized)
+		schedule_work(&ds->output_worker);
+	spin_unlock_irqrestore(&ds->base.lock, flags);
 }
 
 /*
@@ -954,7 +971,7 @@ static int dualsense_parse_report(struct ps_device *ps_dev, struct hid_report *r
 		spin_unlock_irqrestore(&ps_dev->lock, flags);
 
 		/* Schedule updating of microphone state at hardware level. */
-		schedule_work(&ds->output_worker);
+		dualsense_schedule_work(ds);
 	}
 	ds->last_btn_mic_state = btn_mic_state;
 
@@ -962,8 +979,7 @@ static int dualsense_parse_report(struct ps_device *ps_dev, struct hid_report *r
 	for (i = 0; i < ARRAY_SIZE(ds_report->gyro); i++) {
 		int raw_data = (short)le16_to_cpu(ds_report->gyro[i]);
 		int calib_data = mult_frac(ds->gyro_calib_data[i].sens_numer,
-					   raw_data - ds->gyro_calib_data[i].bias,
-					   ds->gyro_calib_data[i].sens_denom);
+					   raw_data, ds->gyro_calib_data[i].sens_denom);
 
 		input_report_abs(ds->sensors, ds->gyro_calib_data[i].abs_code, calib_data);
 	}
@@ -1069,8 +1085,20 @@ static int dualsense_play_effect(struct input_dev *dev, void *data, struct ff_ef
 	ds->motor_right = effect->u.rumble.weak_magnitude / 256;
 	spin_unlock_irqrestore(&ds->base.lock, flags);
 
-	schedule_work(&ds->output_worker);
+	dualsense_schedule_work(ds);
 	return 0;
+}
+
+static void dualsense_remove(struct ps_device *ps_dev)
+{
+	struct dualsense *ds = container_of(ps_dev, struct dualsense, base);
+	unsigned long flags;
+
+	spin_lock_irqsave(&ds->base.lock, flags);
+	ds->output_worker_initialized = false;
+	spin_unlock_irqrestore(&ds->base.lock, flags);
+
+	cancel_work_sync(&ds->output_worker);
 }
 
 static int dualsense_reset_leds(struct dualsense *ds)
@@ -1105,7 +1133,7 @@ static void dualsense_set_lightbar(struct dualsense *ds, uint8_t red, uint8_t gr
 	ds->lightbar_green = green;
 	ds->lightbar_blue = blue;
 
-	schedule_work(&ds->output_worker);
+	dualsense_schedule_work(ds);
 }
 
 static void dualsense_set_player_leds(struct dualsense *ds)
@@ -1128,7 +1156,7 @@ static void dualsense_set_player_leds(struct dualsense *ds)
 
 	ds->update_player_leds = true;
 	ds->player_leds_state = player_ids[player_id];
-	schedule_work(&ds->output_worker);
+	dualsense_schedule_work(ds);
 }
 
 static struct ps_device *dualsense_create(struct hid_device *hdev)
@@ -1154,7 +1182,9 @@ static struct ps_device *dualsense_create(struct hid_device *hdev)
 	ps_dev->battery_capacity = 100; /* initial value until parse_report. */
 	ps_dev->battery_status = POWER_SUPPLY_STATUS_UNKNOWN;
 	ps_dev->parse_report = dualsense_parse_report;
+	ps_dev->remove = dualsense_remove;
 	INIT_WORK(&ds->output_worker, dualsense_output_worker);
+	ds->output_worker_initialized = true;
 	hid_set_drvdata(hdev, ds);
 
 	max_output_report_size = sizeof(struct dualsense_output_report_bt);
@@ -1306,6 +1336,9 @@ static void ps_remove(struct hid_device *hdev)
 
 	ps_devices_list_remove(dev);
 	ps_device_release_player_id(dev);
+
+	if (dev->remove)
+		dev->remove(dev);
 
 	hid_hw_close(hdev);
 	hid_hw_stop(hdev);
